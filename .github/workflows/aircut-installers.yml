@@ -1,0 +1,159 @@
+name: aircut Windows and Linux installers
+
+# Builds aircut's Windows and Linux installers from the private source repo
+# (airadiolabs/aircut, read through the read-only deploy key AIRCUT_DEPLOY_KEY)
+# and attaches them to the release aircut-vX.Y.Z here. Runs here because this
+# repo is public, so Actions minutes are free.
+#
+# A missing release is created as a DRAFT: the in-app updater skips drafts, so
+# nobody is told about an update until every installer is attached. Add the
+# notarized macOS DMG (installer/macos/build-notarized.sh --release), then
+# publish the draft.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: aircut branch, tag or commit to build
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: airadiolabs/aircut
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.AIRCUT_DEPLOY_KEY }}
+
+      - name: Read version from CMakeLists.txt
+        id: version
+        shell: bash
+        run: echo "VERSION=$(sed -n 's/^project(AirCutPro VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout JUCE 8.0.11
+        run: git clone --depth 1 --branch 8.0.11 https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Fetch bundled tools (yt-dlp, ffmpeg)
+        shell: bash
+        run: scripts/fetch-tools.sh windows
+
+      - name: Configure (x64 Release)
+        run: cmake -B build_release -A x64 -DCMAKE_BUILD_TYPE=Release -DAIRCUT_MINIMAL_BUILD=OFF
+
+      - name: Build
+        run: cmake --build build_release --config Release --target AirCutPro -- /verbosity:minimal
+
+      - name: Install NSIS
+        run: choco install nsis --no-progress -y
+
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /DPRODUCT_VERSION=$version installer\windows\AirCutPro.nsi
+          Move-Item "installer\windows\aircut-$version-Setup.exe" "aircut-$version-Setup.exe"
+
+      - name: Sign installer (when a certificate is configured)
+        if: ${{ env.CERTIFICATE_BASE64 != '' }}
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $certPath = "$env:TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+          & $signtool.FullName sign /fd SHA256 /p $env:CERTIFICATE_PASSWORD /f $certPath `
+            /tr http://timestamp.digicert.com /td SHA256 "aircut-$version-Setup.exe"
+          Remove-Item $certPath
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: aircut-${{ steps.version.outputs.VERSION }}-Setup.exe
+          retention-days: 7
+
+  linux:
+    # 22.04: the oldest supported Ubuntu, so the binary runs on newer ones too
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: airadiolabs/aircut
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.AIRCUT_DEPLOY_KEY }}
+
+      - name: Read version from CMakeLists.txt
+        id: version
+        run: echo "VERSION=$(sed -n 's/^project(AirCutPro VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libjack-jackd2-dev libcurl4-openssl-dev \
+            libfreetype6-dev libfontconfig1-dev libx11-dev libxcomposite-dev \
+            libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev \
+            libgl1-mesa-dev ninja-build
+
+      - name: Checkout JUCE 8.0.11
+        run: git clone --depth 1 --branch 8.0.11 https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Fetch bundled tools (yt-dlp, ffmpeg)
+        run: scripts/fetch-tools.sh linux
+
+      - name: Configure and build
+        run: |
+          cmake -B build_release -G Ninja -DCMAKE_BUILD_TYPE=Release -DAIRCUT_MINIMAL_BUILD=OFF
+          cmake --build build_release --target AirCutPro
+
+      - name: Package .deb and .tar.gz
+        run: |
+          version="${{ steps.version.outputs.VERSION }}"
+          (cd build_release && cpack -G DEB)
+          mv build_release/aircut-$version-linux-amd64.deb .
+          # Portable archive: the app folder as installed in /opt/aircut
+          mkdir -p dist/aircut
+          cp build_release/AirCutPro_artefacts/Release/aircut dist/aircut/
+          cp -r tools/linux dist/aircut/tools
+          cp installer/linux/aircut.desktop icon.png dist/aircut/
+          tar -C dist -czf aircut-$version-linux-x86_64.tar.gz aircut
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            aircut-${{ steps.version.outputs.VERSION }}-linux-amd64.deb
+            aircut-${{ steps.version.outputs.VERSION }}-linux-x86_64.tar.gz
+          retention-days: 7
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach to release aircut-v${{ needs.windows.outputs.version }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.windows.outputs.version }}
+        run: |
+          tag="aircut-v$VERSION"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --draft --title "aircut $VERSION" \
+              --notes "aircut{+} $VERSION for macOS, Windows and Linux. Start a free 14-day trial in the app with your email, then buy a licence to keep it."
+          fi
+          gh release upload "$tag" dist/* --clobber
